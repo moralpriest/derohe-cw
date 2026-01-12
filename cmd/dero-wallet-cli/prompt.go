@@ -28,11 +28,13 @@ import (
 	"unicode"
 
 	"github.com/chzyer/readline"
+	"github.com/creachadair/jrpc2"
 	"github.com/deroproject/derohe/config"
 	"github.com/deroproject/derohe/cryptography/crypto"
 	"github.com/deroproject/derohe/globals"
 	"github.com/deroproject/derohe/rpc"
 	"github.com/deroproject/derohe/walletapi"
+	"github.com/deroproject/derohe/walletapi/xswd"
 )
 
 //import "io/ioutil"
@@ -97,18 +99,7 @@ func handle_prompt_command(l *readline.Instance, line string) {
 
 		switch len(line_parts) {
 		case 0:
-			addr := wallet.GetAddress().String()
-			for scid := range wallet.GetAccount().EntriesNative {
-				if !scid.IsZero() {
-					balance, _, err := wallet.GetDecryptedBalanceAtTopoHeight(scid, -1, addr)
-					if err != nil {
-						logger.Error(err, "error during Sc balance", "scid", scid.String())
-					} else {
-						// TODO digits token standard
-						fmt.Fprintf(l.Stderr(), "SCID %s Balance: "+color_green+"%d"+color_white+"\n\n", scid, balance)
-					}
-				}
-			}
+			//logger.Error(err,"not implemented")
 			break
 
 		case 1: // scid balance
@@ -316,15 +307,6 @@ func handle_prompt_command(l *readline.Instance, line string) {
 		logger.Info("Menu mode enabled")
 	case "i8", "integrated_address": // user wants a random integrated address 8 bytes
 		a := wallet.GetRandomIAddress8()
-		if ConfirmYesNoDefaultNo(l, "Do you want to set a specific SCID ? (y/N)") {
-			scid, err := ReadSCID(l)
-			if err != nil {
-				logger.Error(err, "Error reading SCID")
-				break
-			}
-			a.Arguments = append(a.Arguments, rpc.Argument{Name: rpc.RPC_ASSET, DataType: rpc.DataHash, Value: scid})
-		}
-
 		fmt.Fprintf(l.Stderr(), "Wallet integrated address : "+color_green+"%s"+color_white+"\n", a.String())
 		fmt.Fprintf(l.Stderr(), "Embedded Arguments : "+color_green+"%s"+color_white+"\n", a.Arguments)
 
@@ -444,7 +426,7 @@ func handle_prompt_command(l *readline.Instance, line string) {
 	case "": // blank enter key just loop
 	default:
 		//fmt.Fprintf(l.Stderr(), "you said: %s", strconv.Quote(line))
-		logger.Error(err, "No such command")
+		logger.Error(err, "No such command", "command", command)
 	}
 
 }
@@ -817,6 +799,102 @@ func ConfirmYesNoDefaultNo(l *readline.Instance, prompt_temporary string) bool {
 		return true
 	}
 	return false
+}
+
+func ReadStringXSWDPrompt(l *readline.Instance, onClose chan bool, prompt string, values []string) (a string) {
+	prompt_mutex.Lock()
+
+	conf := l.GenPasswordConfig()
+	conf.EnableMask = false
+
+	conf.SetListener(func(line []rune, pos int, key rune) (newLine []rune, newPos int, ok bool) {
+		color := color_green
+
+		found := false
+		for _, v := range values {
+			if v == strings.ToUpper(string(line)) {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			color = color_red
+		}
+
+		l.SetPrompt(fmt.Sprintf("%sXSWD: %s", color, prompt))
+		l.Refresh()
+
+		return nil, 0, false
+	})
+
+	defer func() {
+		l.SetPrompt(color_normal)
+		l.Refresh()
+		prompt_mutex.Unlock()
+	}()
+
+	l.Operation.KickReader()
+
+	input := make(chan string)
+	validValue := false
+	for !validValue {
+		go func() {
+			line, err := l.ReadPasswordWithConfig(conf)
+			if err == readline.ErrInterrupt {
+				if len(line) == 0 {
+					logger.Info("Ctrl-C received, Exiting")
+					os.Exit(0)
+				}
+			} else if err == io.EOF {
+				os.Exit(0)
+			} else if err != nil {
+				logger.Error(err, "Error reading input")
+			}
+			value := strings.ToUpper(string(line))
+			input <- value
+		}()
+
+		select {
+		case <-onClose:
+			l.Operation.KickReader()
+			return ""
+		case a = <-input:
+		}
+
+		for _, v := range values {
+			if v == a {
+				validValue = true
+				break
+			}
+		}
+	}
+	return
+}
+
+// Ask permission for request
+func AskPermissionForRequest(l *readline.Instance, app *xswd.ApplicationData, request *jrpc2.Request) xswd.Permission {
+	method := request.Method()
+	param := strings.ReplaceAll(strings.Join(strings.Fields(request.ParamString()), " "), "\n", " ")
+
+	values := []string{"A", "D", "AA", "AD"}
+	prompt := fmt.Sprintf("Request from %s: %s | Params: %s | Do you want to allow this request ? ([A]llow / [D]eny / [AA] Always Allow / [AD] Always Deny): ", app.Name, method, param)
+	if !xswd_server.CanStorePermission(method) {
+		values = []string{"A", "D", "AD"}
+		prompt = fmt.Sprintf("Request from %s: %s | Params: %s | Do you want to allow this request ? ([A]llow / [D]eny / [AD] Always Deny): ", app.Name, method, param)
+	}
+
+	line := ReadStringXSWDPrompt(l, app.OnClose, prompt, values)
+
+	if strings.ToUpper(strings.TrimSpace(line)) == "A" {
+		return xswd.Allow
+	} else if strings.ToUpper(strings.TrimSpace(line)) == "AA" {
+		return xswd.AlwaysAllow
+	} else if strings.ToUpper(strings.TrimSpace(line)) == "AD" {
+		return xswd.AlwaysDeny
+	}
+
+	return xswd.Deny
 }
 
 // confirms whether user knows the current password for the wallet
